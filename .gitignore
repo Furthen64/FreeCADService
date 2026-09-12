@@ -55,3 +55,10 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Local experimentation / scratch (e2e logs, state, probes)
+work/
+
+# Python (FreeCAD worker/render scripts)
+__pycache__/
+*.pyc
