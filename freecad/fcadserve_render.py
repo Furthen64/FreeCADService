@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 
 MAX_EDGE_LABELS = 24
+CLUSTER_MIN_EDGES = 3
 
 
 def _norm(v):
@@ -244,8 +245,94 @@ def validate_png(path, expected_width, expected_height):
         raise RuntimeError("PNG contains no visible non-white model pixels")
 
 
+def _edge_label_plan(labels, screen_right, screen_up, shape_diagonal):
+    """Return direct labels and grouped callouts in screen coordinates.
+
+    STL imports commonly approximate a cylindrical or filleted face with a fan
+    of equal straight edges.  Annotating each member is both redundant and
+    unreadable.  Equal-length edges that are close in the current projection
+    are therefore represented by one callout (``length mm x N edges``).
+    """
+    if not labels:
+        return [], []
+
+    # Work in projected model units, not pixels: labels are added before
+    # ``fitAll`` and Coin overlays deliberately do not affect the fitted box.
+    proximity = max(shape_diagonal * 0.075, 1e-4)
+    length_tolerance = max(shape_diagonal * 1e-5, 1e-4)
+    pending = []
+    for length, midpoint in labels:
+        pending.append({
+            "length": length,
+            "midpoint": midpoint,
+            "x": midpoint.dot(screen_right),
+            "y": midpoint.dot(screen_up),
+        })
+
+    # Connected components make a curved run one balloon even when its
+    # individual facet midpoints form a chain rather than a tight point cloud.
+    groups = []
+    while pending:
+        group = [pending.pop()]
+        changed = True
+        while changed:
+            changed = False
+            for candidate in pending[:]:
+                if any(
+                    abs(candidate["length"] - member["length"]) <= length_tolerance
+                    and math.hypot(candidate["x"] - member["x"], candidate["y"] - member["y"]) <= proximity
+                    for member in group
+                ):
+                    pending.remove(candidate)
+                    group.append(candidate)
+                    changed = True
+        groups.append(group)
+
+    direct, callouts = [], []
+    for group in groups:
+        if len(group) < CLUSTER_MIN_EDGES:
+            direct.extend(group)
+            continue
+        count = len(group)
+        callouts.append({
+            "length": sum(item["length"] for item in group) / count,
+            "count": count,
+            "midpoint": sum((item["midpoint"] for item in group), group[0]["midpoint"] * 0) / count,
+            "x": sum(item["x"] for item in group) / count,
+            "y": sum(item["y"] for item in group) / count,
+        })
+    return direct, callouts
+
+
+def _callout_positions(callouts, shape, screen_right, screen_up):
+    """Place grouped labels just outside their edge cluster without overlap."""
+    if not callouts:
+        return
+    bb = shape.BoundBox
+    center = (bb.Center.dot(screen_right), bb.Center.dot(screen_up))
+    diagonal = max(math.hypot(bb.XLength, bb.YLength, bb.ZLength), 1.0)
+    # Text is sized in pixels while this offset is in model units.  Keep a
+    # generous gap so the whole callout stays outside the solid after fitAll.
+    offset = diagonal * 0.20
+    spacing = diagonal * 0.10
+    used = []
+    for callout in sorted(callouts, key=lambda item: (item["y"], item["x"])):
+        dx, dy = callout["x"] - center[0], callout["y"] - center[1]
+        distance = math.hypot(dx, dy)
+        if distance < 1e-6:
+            dx, dy, distance = 0.0, 1.0, 1.0
+        dx, dy = dx / distance, dy / distance
+        x, y = callout["x"] + dx * offset, callout["y"] + dy * offset
+        # Nudge successive balloons along their tangent if they would collide.
+        while any(math.hypot(x - ux, y - uy) < spacing for ux, uy in used):
+            x += -dy * spacing
+            y += dx * spacing
+        used.append((x, y))
+        callout["label_point"] = callout["midpoint"] + screen_right * (x - callout["x"]) + screen_up * (y - callout["y"])
+
+
 def add_edge_length_labels(render_view, shape, direction, up):
-    """Add screen-facing labels for the model's most useful straight edges.
+    """Add direct labels and aggregated callouts for useful straight edges.
 
     Labels are Coin scene-graph overlays, rather than Draft dimensions, so they
     neither require a workbench nor enlarge the model's fitted bounding box.
@@ -288,19 +375,57 @@ def add_edge_length_labels(render_view, shape, direction, up):
     if not labels:
         return
 
+    shape_diagonal = math.hypot(shape.BoundBox.XLength, shape.BoundBox.YLength, shape.BoundBox.ZLength)
+    direct_labels, callouts = _edge_label_plan(labels, screen_right, screen_up, shape_diagonal)
+    _callout_positions(callouts, shape, screen_right, screen_up)
+
     root = coin.SoSeparator()
     color = coin.SoBaseColor()
     color.rgb = (0.10, 0.10, 0.10)
     root.addChild(color)
+    # An annotation must remain legible even when its screen-facing callout
+    # crosses the projected silhouette of the part.
+    depth_buffer = coin.SoDepthBuffer()
+    depth_buffer.test = False
+    depth_buffer.write = False
+    root.addChild(depth_buffer)
     font = coin.SoFont()
-    font.size = 14
+    font.size = 16
     root.addChild(font)
-    for length, midpoint in labels:
+    for label in direct_labels:
         item = coin.SoSeparator()
         translation = coin.SoTranslation()
-        translation.translation = midpoint
+        translation.translation = label["midpoint"]
         text = coin.SoText2()
-        text.string = f"{length:.2f} mm"
+        text.string = f"{label['length']:.2f} mm"
+        text.justification = coin.SoText2.CENTER
+        item.addChild(translation)
+        item.addChild(text)
+        root.addChild(item)
+
+    for callout in callouts:
+        # A short leader makes it clear which dense edge run the balloon
+        # summarizes.  This is a screen-facing world-space line, so it follows
+        # the model through the orthographic capture without changing fitAll.
+        leader = coin.SoSeparator()
+        style = coin.SoDrawStyle()
+        style.lineWidth = 1.5
+        leader.addChild(style)
+        coordinates = coin.SoCoordinate3()
+        coordinates.point.setValues(0, 2, [callout["midpoint"], callout["label_point"]])
+        leader.addChild(coordinates)
+        line = coin.SoLineSet()
+        line.numVertices = 2
+        leader.addChild(line)
+        root.addChild(leader)
+
+        item = coin.SoSeparator()
+        translation = coin.SoTranslation()
+        translation.translation = callout["label_point"]
+        text = coin.SoText2()
+        # Keep the balloon narrow; its leader supplies the association and
+        # ``xN`` clearly means that N equal-length edges were summarized.
+        text.string = f"{callout['length']:.2f} mm x{callout['count']}"
         text.justification = coin.SoText2.CENTER
         item.addChild(translation)
         item.addChild(text)
