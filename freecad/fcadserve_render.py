@@ -331,6 +331,59 @@ def _callout_positions(callouts, shape, screen_right, screen_up):
         callout["label_point"] = callout["midpoint"] + screen_right * (x - callout["x"]) + screen_up * (y - callout["y"])
 
 
+def _edge_midpoint_is_visible(shape, midpoint, camera_direction, part):
+    """Whether a ray from the camera can reach an edge midpoint unobstructed."""
+    diagonal = max(math.hypot(shape.BoundBox.XLength, shape.BoundBox.YLength, shape.BoundBox.ZLength), 1.0)
+    epsilon = diagonal * 1e-5
+    # ``camera_direction`` points from camera to model.  Stop just short of
+    # the midpoint so an exposed edge does not intersect its own face.
+    ray = part.makeLine(
+        midpoint - camera_direction * (diagonal * 2.0),
+        midpoint - camera_direction * epsilon,
+    )
+    try:
+        # ``common`` only reports an overlap with a solid volume.  Imported
+        # STEP shapes may be shells, so test the ray against their surfaces
+        # instead; the ray stops short of an exposed edge's own surface.
+        intersections = shape.section(ray)
+        return not getattr(intersections, "Vertexes", []) and not getattr(intersections, "Edges", [])
+    except Exception:
+        # Do not make a preview lose all dimensions if an unusual imported
+        # shape cannot perform this inexpensive boolean query.
+        return True
+
+
+def _add_callout_background(root, callout, screen_right, screen_up, shape_diagonal, coin):
+    """Add an opaque, screen-facing backing plate before the callout text."""
+    label = f"{callout['length']:.2f} mm x{callout['count']}"
+    # SoText2 is pixel sized, whereas the plate is in model units.  These
+    # conservative proportions leave padding around the 16px monospace text
+    # across the normal fitted preview sizes.
+    half_width = shape_diagonal * (0.009 * len(label) + 0.025)
+    half_height = shape_diagonal * 0.026
+    center = callout["label_point"] + screen_up * (half_height * 0.20)
+    points = [
+        center - screen_right * half_width - screen_up * half_height,
+        center + screen_right * half_width - screen_up * half_height,
+        center + screen_right * half_width + screen_up * half_height,
+        center - screen_right * half_width + screen_up * half_height,
+    ]
+    background = coin.SoSeparator()
+    light_model = coin.SoLightModel()
+    light_model.model = coin.SoLightModel.BASE_COLOR
+    background.addChild(light_model)
+    white = coin.SoBaseColor()
+    white.rgb = (1.0, 1.0, 1.0)
+    background.addChild(white)
+    coordinates = coin.SoCoordinate3()
+    coordinates.point.setValues(0, 4, points)
+    background.addChild(coordinates)
+    face = coin.SoFaceSet()
+    face.numVertices = 4
+    background.addChild(face)
+    root.addChild(background)
+
+
 def add_edge_length_labels(render_view, shape, direction, up):
     """Add direct labels and aggregated callouts for useful straight edges.
 
@@ -340,6 +393,7 @@ def add_edge_length_labels(render_view, shape, direction, up):
     rarely a useful manufacturing dimension and they make previews illegible.
     """
     import FreeCAD as App  # noqa: PLC0415
+    import Part  # noqa: PLC0415
     from pivy import coin  # noqa: PLC0415
 
     labels = []
@@ -365,6 +419,8 @@ def add_edge_length_labels(render_view, shape, direction, up):
         # An edge parallel to the camera ray is invisible (a point or an
         # overlapping line) in the PNG, so annotating it is misleading.
         if projected_length <= edge.Length * 1e-4:
+            continue
+        if not _edge_midpoint_is_visible(shape, (start + end) * 0.5, camera_direction, Part):
             continue
         labels.append((edge.Length, (start + end) * 0.5))
 
@@ -418,6 +474,8 @@ def add_edge_length_labels(render_view, shape, direction, up):
         line.numVertices = 2
         leader.addChild(line)
         root.addChild(leader)
+
+        _add_callout_background(root, callout, screen_right, screen_up, shape_diagonal, coin)
 
         item = coin.SoSeparator()
         translation = coin.SoTranslation()
