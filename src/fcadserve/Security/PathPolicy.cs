@@ -67,7 +67,16 @@ public sealed record OutputValidation(
     string IsoPngPath,
     string SectionPngPath,
     string ReportPath,
-    bool SectionAvailable);
+    bool SectionAvailable)
+{
+    public string LeftPngPath { get; init; } = "";
+    public string TopPngPath { get; init; } = "";
+    public string RightPngPath { get; init; } = "";
+    public string BottomPngPath { get; init; } = "";
+
+    public IReadOnlyList<string> RenderPngPaths =>
+        [IsoPngPath, SectionPngPath, LeftPngPath, TopPngPath, RightPngPath, BottomPngPath];
+}
 
 /// <summary>
 /// Validates job inputs and outputs against the configured filesystem policy.
@@ -95,7 +104,10 @@ public sealed class PathPolicy(Options.ServiceOptions options)
         // Never overwrite the input STL and avoid clobbering existing artifacts.
         if (!options.OverwriteArtifacts)
         {
-            var existing = new[] { output.StepPath, output.IsoPngPath, output.SectionPngPath, output.ReportPath }.Where(File.Exists).ToList();
+            var existing = new[] { output.StepPath, output.ReportPath }
+                .Concat(output.RenderPngPaths)
+                .Where(File.Exists)
+                .ToList();
             if (existing.Count > 0)
                 throw new PathValidationException("output_already_exists",
                     $"target artifact already exists in output directory (use overwrite policy or a different output_dir): {string.Join(", ", existing)}");
@@ -170,18 +182,26 @@ public sealed class PathPolicy(Options.ServiceOptions options)
         var step = Path.Combine(resolvedOut, $"{stem}.stp");
         var iso = Path.Combine(resolvedOut, $"{stem}_iso.png");
         var section = Path.Combine(resolvedOut, $"{stem}_section.png");
+        var left = Path.Combine(resolvedOut, $"{stem}_left.png");
+        var top = Path.Combine(resolvedOut, $"{stem}_top.png");
+        var right = Path.Combine(resolvedOut, $"{stem}_right.png");
+        var bottom = Path.Combine(resolvedOut, $"{stem}_bottom.png");
         var report = Path.Combine(resolvedOut, $"{stem}.report.json");
 
         // Never overwrite the input STL (name-space collision is inherent to the layout).
-        if (string.Equals(Path.GetFullPath(step), resolvedInput, StringComparison.Ordinal)
-            || string.Equals(Path.GetFullPath(iso), resolvedInput, StringComparison.Ordinal)
-            || string.Equals(Path.GetFullPath(section), resolvedInput, StringComparison.Ordinal)
-            || string.Equals(Path.GetFullPath(report), resolvedInput, StringComparison.Ordinal))
+        if (new[] { step, report, iso, section, left, top, right, bottom }
+            .Any(path => string.Equals(Path.GetFullPath(path), resolvedInput, StringComparison.Ordinal)))
             throw new PathValidationException("artifact_collides_with_input", "derived artifact name collides with the input file.");
 
         return (
             new InputValidation(stlPath, resolvedInput, stem, size, ""),
-            new OutputValidation(resolvedOut, step, iso, section, report, SectionAvailable: true));
+            new OutputValidation(resolvedOut, step, iso, section, report, SectionAvailable: true)
+            {
+                LeftPngPath = left,
+                TopPngPath = top,
+                RightPngPath = right,
+                BottomPngPath = bottom,
+            });
     }
 
     private static string ComputeSha256(string path)

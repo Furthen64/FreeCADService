@@ -161,6 +161,10 @@ public class PathPolicyTests
         Assert.Equal("my.part.stp", Path.GetFileName(output.StepPath));
         Assert.Equal("my.part_iso.png", Path.GetFileName(output.IsoPngPath));
         Assert.Equal("my.part_section.png", Path.GetFileName(output.SectionPngPath));
+        Assert.Equal("my.part_left.png", Path.GetFileName(output.LeftPngPath));
+        Assert.Equal("my.part_top.png", Path.GetFileName(output.TopPngPath));
+        Assert.Equal("my.part_right.png", Path.GetFileName(output.RightPngPath));
+        Assert.Equal("my.part_bottom.png", Path.GetFileName(output.BottomPngPath));
         Assert.Equal("my.part.report.json", Path.GetFileName(output.ReportPath));
         Cleanup(box.Root);
     }

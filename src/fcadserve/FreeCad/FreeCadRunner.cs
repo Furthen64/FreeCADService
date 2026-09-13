@@ -20,7 +20,7 @@ public enum FreeCadRunKind
     /// <summary>Headless pipeline (FreeCADCmd): load, reconstruct, export, validate, report.</summary>
     Pipeline,
 
-    /// <summary>GUI renderer under Xvfb: isometric + cutaway PNGs and report patch.</summary>
+    /// <summary>GUI renderer under Xvfb: six standard view PNGs and report patch.</summary>
     Render,
 }
 

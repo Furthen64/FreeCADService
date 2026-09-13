@@ -27,7 +27,15 @@ public sealed class JobExecutor(
         string ProgressPath,
         string StatusPath);
 
-    private sealed record TargetNames(string Step, string IsoPng, string SectionPng, string Report);
+    private sealed record TargetNames(
+        string Step,
+        string IsoPng,
+        string SectionPng,
+        string LeftPng,
+        string TopPng,
+        string RightPng,
+        string BottomPng,
+        string Report);
 
     private sealed record RenderOptions(int Width, int Height);
 
@@ -211,6 +219,10 @@ public sealed class JobExecutor(
             Step: Path.GetFileName(output.StepPath),
             IsoPng: Path.GetFileName(output.IsoPngPath),
             SectionPng: Path.GetFileName(output.SectionPngPath),
+            LeftPng: Path.GetFileName(output.LeftPngPath),
+            TopPng: Path.GetFileName(output.TopPngPath),
+            RightPng: Path.GetFileName(output.RightPngPath),
+            BottomPng: Path.GetFileName(output.BottomPngPath),
             Report: Path.GetFileName(output.ReportPath));
 
         var p = new WorkerParams(
@@ -290,21 +302,38 @@ public sealed class JobExecutor(
         Directory.CreateDirectory(output.Directory);
 
         var step = Path.Combine(artifactsDir, Path.GetFileName(output.StepPath));
-        var iso = Path.Combine(artifactsDir, Path.GetFileName(output.IsoPngPath));
-        var section = Path.Combine(artifactsDir, Path.GetFileName(output.SectionPngPath));
         var report = Path.Combine(artifactsDir, Path.GetFileName(output.ReportPath));
 
         var failures = new List<string>();
+        var published = new List<ArtifactFile>();
 
-        Publish(step, output.StepPath, out var stepPub, failures);
-        Publish(iso, output.IsoPngPath, out var isoPub, failures);
-        Publish(report, output.ReportPath, out var reportPub, failures);
-
-        ArtifactFile? sectionPub = null;
-        if (File.Exists(section))
+        var requiredRenderPaths = new[]
         {
-            Publish(section, output.SectionPngPath, out var sec, null);
-            sectionPub = sec;
+            output.IsoPngPath,
+            output.LeftPngPath,
+            output.TopPngPath,
+            output.RightPngPath,
+            output.BottomPngPath,
+        };
+        var requiredArtifacts = new[]
+        {
+            (step, output.StepPath),
+            (report, output.ReportPath),
+        }.Concat(requiredRenderPaths.Select(path =>
+            (Path.Combine(artifactsDir, Path.GetFileName(path)), path)));
+        var optionalSection = (Path.Combine(artifactsDir, Path.GetFileName(output.SectionPngPath)), output.SectionPngPath);
+
+        foreach (var (source, destination) in requiredArtifacts)
+        {
+            Publish(source, destination, out var artifact, failures);
+            if (artifact is not null)
+                published.Add(artifact);
+        }
+        if (File.Exists(optionalSection.Item1))
+        {
+            Publish(optionalSection.Item1, optionalSection.Item2, out var artifact, failures);
+            if (artifact is not null)
+                published.Add(artifact);
         }
 
         if (failures.Count > 0)
@@ -314,11 +343,7 @@ public sealed class JobExecutor(
                 $"required artifacts were not produced: {string.Join(", ", failures)}", worker.ReportPath, CollectWorkArtifacts(jobDir));
         }
 
-        var artifacts = new List<ArtifactFile>();
-        if (stepPub is not null) artifacts.Add(stepPub);
-        if (isoPub is not null) artifacts.Add(isoPub);
-        if (sectionPub is not null) artifacts.Add(sectionPub);
-        if (reportPub is not null) artifacts.Add(reportPub);
+        var artifacts = new List<ArtifactFile>(published);
         artifacts.AddRange(CollectWorkArtifacts(jobDir));
 
         var status = worker.Status == "skipped" ? JobStatus.Skipped : JobStatus.Succeeded;
@@ -341,6 +366,10 @@ public sealed class JobExecutor(
             || name.EndsWith(".step", StringComparison.OrdinalIgnoreCase)) return "step";
         if (name.EndsWith("_iso.png", StringComparison.OrdinalIgnoreCase)) return "iso_png";
         if (name.EndsWith("_section.png", StringComparison.OrdinalIgnoreCase)) return "section_png";
+        if (name.EndsWith("_left.png", StringComparison.OrdinalIgnoreCase)) return "left_png";
+        if (name.EndsWith("_top.png", StringComparison.OrdinalIgnoreCase)) return "top_png";
+        if (name.EndsWith("_right.png", StringComparison.OrdinalIgnoreCase)) return "right_png";
+        if (name.EndsWith("_bottom.png", StringComparison.OrdinalIgnoreCase)) return "bottom_png";
         if (name.EndsWith(".report.json", StringComparison.OrdinalIgnoreCase)) return "report";
         if (name == "status.json") return "status";
         if (name == "freecad_console.log") return "console_log";

@@ -39,6 +39,13 @@ public sealed class ServiceOptions
     /// </summary>
     public bool OverwriteArtifacts { get; set; }
 
+    /// <summary>
+    /// Staging directory for uploaded STL files. Uploaded files are
+    /// automatically treated as allowed inputs. When empty, defaults to
+    /// <c>&lt;StateRoot&gt;/uploads</c>.
+    /// </summary>
+    public string UploadRoot { get; set; } = "";
+
     public string LogLevel { get; set; } = "Information";
 
     public FreeCadOptions FreeCad { get; set; } = new();

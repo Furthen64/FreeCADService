@@ -74,6 +74,8 @@ public class JobExecutorTests
         File.WriteAllBytes(iso, content);
         if (includeSection)
             File.WriteAllBytes(Path.Combine(artifactsDir, (string)targets["section_png"]!), content);
+        foreach (var name in new[] { "left", "top", "right", "bottom" })
+            File.WriteAllBytes(Path.Combine(artifactsDir, (string)targets[$"{name}_png"]!), content);
         var report = Path.Combine(artifactsDir, (string)targets["report"]!);
         File.WriteAllText(report, "{\"ok\":true}");
 
@@ -135,7 +137,7 @@ public class JobExecutorTests
     }
 
     [Fact]
-    public async Task Missing_section_image_with_valid_iso_still_succeeds()
+    public async Task Missing_section_image_is_published_as_an_optional_artifact()
     {
         var (executor, runner, store, scope, stl, outDir) = Harness();
         using var _ = scope;
@@ -152,8 +154,9 @@ public class JobExecutorTests
 
         var final = (await store.GetAsync(job.Id))!;
         Assert.Equal(JobStatus.Skipped, final.Status);
+        Assert.Null(final.ErrorCode);
         Assert.DoesNotContain(final.Artifacts(), a => a.Kind == "section_png");
-        Assert.Contains(final.Artifacts(), a => a.Kind == "iso_png");
+        Assert.False(File.Exists(Path.Combine(outDir, "part_section.png")));
     }
 
     [Fact]

@@ -11,6 +11,36 @@ public static class Endpoints
     {
         var v1 = app.MapGroup("/v1");
 
+        v1.MapPost("/uploads", async (HttpRequest req, UploadStore uploads, CancellationToken ct) =>
+        {
+            var name = req.Query["name"].ToString();
+            if (string.IsNullOrWhiteSpace(name))
+                name = ParseContentDispositionFilename(req);
+
+            try
+            {
+                var result = await uploads.StoreAsync(name, req.Body, ct);
+                return Results.Json(new
+                {
+                    upload_id = result.Id,
+                    name = result.Name,
+                    stl_path = result.Path,
+                    size_bytes = result.SizeBytes,
+                    sha256 = result.Sha256,
+                    submit_url = "/v1/jobs",
+                }, statusCode: StatusCodes.Status201Created);
+            }
+            catch (UploadFilenameException ex)
+            {
+                return Results.Json(Error(ex.Code, ex.Message), statusCode: StatusCodes.Status400BadRequest);
+            }
+            catch (UploadTooLargeException ex)
+            {
+                return Results.Json(Error("input_too_large", ex.Message),
+                    statusCode: StatusCodes.Status413PayloadTooLarge);
+            }
+        });
+
         v1.MapPost("/jobs", async (SubmitJobRequest? req, JobDirector director, HttpContext ctx, CancellationToken ct) =>
         {
             if (req is null)
@@ -94,6 +124,21 @@ public static class Endpoints
                 : Results.Json(new { ready = false, checks = mapped },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
         });
+    }
+
+    private static string ParseContentDispositionFilename(HttpRequest req)
+    {
+        var disposition = req.Headers.ContentDisposition.ToString();
+        if (string.IsNullOrEmpty(disposition))
+            return "";
+        foreach (var part in disposition.Split(';'))
+        {
+            var trim = part.Trim();
+            if (!trim.StartsWith("filename=", StringComparison.OrdinalIgnoreCase))
+                continue;
+            return trim["filename=".Length..].Trim('"', '\'');
+        }
+        return "";
     }
 
     private static string ContentTypeFor(string name)

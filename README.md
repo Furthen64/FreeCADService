@@ -1,15 +1,16 @@
 # fcadserve
 
 `fcadserve` is a small HTTP service that converts STL meshes to STEP (and
-analytic geometry) using FreeCAD, then renders an isometric and a cut-away
-preview image of the result. It is implemented as a .NET 10 ASP.NET Core
+analytic geometry) using FreeCAD, then renders six orthographic preview images
+of the result: isometric, cut-away, left, top, right, and bottom. It is
+implemented as a .NET 10 ASP.NET Core
 service that drives FreeCAD in two phases:
 
 1. **headless pipeline** (`FreeCADCmd`, no display): load STL -> reconstruct
    analytic geometry (or intentionally fall back) -> export STEP -> re-import
    and validate -> write a JSON report;
-2. **GUI render** (FreeCAD under a per-job Xvfb display): render the isometric
-   PNG and the cutaway PNG and patch the report.
+2. **GUI render** (FreeCAD under a per-job Xvfb display): render all six views
+   and patch the report.
 
 A reconstruction that cannot be turned into a validated analytic solid is not
 an error: the job finishes with status `skipped` and publishes the fallback
@@ -66,6 +67,7 @@ keys keep the `:` path separator, e.g. `--Port=9000` or
 | `FCADSERVE_WORKER_SCRIPT` | `/usr/lib/fcadserve/fcadserve_worker.py` | headless pipeline script |
 | `FCADSERVE_RENDER_SCRIPT` | `/usr/lib/fcadserve/fcadserve_render.py` | GUI render script |
 | `FCADSERVE_OVERWRITE_ARTIFACTS` | `false` | allow overwriting existing artifacts |
+| `FCADSERVE_UPLOAD_ROOT` | `<StateRoot>/uploads` | staging dir for `POST /v1/uploads`; always an allowed input root |
 | `FCADSERVE_LOG_LEVEL` | `Information` | trace/debug/information/warning/error |
 | `FCADSERVE_FREECAD__MODE` | `flatpak` | `flatpak` or `exec` |
 | `FCADSERVE_FREECAD__FLATPAK_APP_ID` | `org.freecad.FreeCAD` | flatpak application id |
@@ -87,6 +89,16 @@ List-style values are `;`- or `,`-separated:
 ## API
 
 All endpoints return JSON.
+
+### `POST /v1/uploads?name=part.stl`
+
+Stage an STL on the server (raw binary body; filename from `?name=` or the
+`Content-Disposition` header). Returns `201` with `{upload_id, name, stl_path,
+size_bytes, sha256}` — `stl_path` is absolute and already inside an allowed
+input root, so it can be submitted to `/v1/jobs` directly. Names are sanitized
+to a bare `stem.stl`, stored uniquely (never overwritten), streamed with a
+running SHA-256, and rejected above `MaxInputSizeBytes` (`413 input_too_large`).
+Errors: `400 missing_filename` / `unsupported_extension` / `empty_upload`.
 
 ### `POST /v1/jobs`
 
@@ -138,6 +150,10 @@ With an input `part.stl`, outputs published into the output directory are:
 - `part.stp` — STEP export (kind `step`);
 - `part_iso.png` — isometric preview (kind `iso_png`);
 - `part_section.png` — cutaway preview (kind `section_png`);
+- `part_left.png` — left view (kind `left_png`);
+- `part_top.png` — top view (kind `top_png`);
+- `part_right.png` — right view (kind `right_png`);
+- `part_bottom.png` — bottom view (kind `bottom_png`);
 - `part.report.json` — machine-readable report (kind `report`).
 
 The manifest also lists per-job sidecars from the state root: `job.json`,
@@ -204,5 +220,5 @@ active worker process groups and their Xvfb displays within `TimeoutStopSec`.
   renderer).
 - `deploy/` — systemd unit.
 - `tests/` — test projects.
-- `tasks/` — outstanding work items (task01...task08) and their status.
+- `tasks/` — work items (task01...task09) and their status.
 - `GENESIS.md` — original requirements/spec.

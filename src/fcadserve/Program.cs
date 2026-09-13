@@ -57,11 +57,25 @@ var options = builder.Configuration.Get<ServiceOptions>() ?? new ServiceOptions(
 options.AllowedInputRoots = PathUtils.SplitList(options.AllowedInputRoots);
 options.AllowedOutputRoots = PathUtils.SplitList(options.AllowedOutputRoots);
 
+// Uploads land in a staging subdirectory of the state root unless configured
+// otherwise, and that staging area is always an allowed input root so uploaded
+// files can be submitted for conversion.
+if (string.IsNullOrWhiteSpace(options.UploadRoot))
+    options.UploadRoot = Path.Combine(options.StateRoot, "uploads");
+options.UploadRoot = Path.GetFullPath(options.UploadRoot);
+options.AllowedInputRoots = [.. options.AllowedInputRoots, options.UploadRoot];
+
+Directory.CreateDirectory(options.UploadRoot);
+
 builder.Logging.SetMinimumLevel(ParseLevel(options.LogLevel));
 builder.WebHost.UseUrls($"http://{options.BindAddress}:{options.Port}");
+// Upload size limits are enforced by UploadStore (streamed count against
+// Jobs.MaxInputSizeBytes) so Kestrel's fixed body cap does not truncate them.
+builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = null);
 
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(new PathPolicy(options));
+builder.Services.AddSingleton<UploadStore>();
 builder.Services.AddSingleton<JobDatabase>();
 builder.Services.AddSingleton<JobStore>();
 builder.Services.AddSingleton<ActiveProcessRegistry>();

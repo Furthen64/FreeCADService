@@ -12,6 +12,7 @@
 #   * step + render artifacts are published and downloadable
 #   * resubmit with the same output directory is rejected with 409
 #   * cancel terminates a job
+#   * POST /v1/uploads stages an STL into the state root with matching sha256
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -117,6 +118,20 @@ until curl -sf "$CLI_HOST/readyz" | python3 -c 'import json,sys; sys.exit(0 if j
 done
 log "readyz ready"
 
+# ---- upload ------------------------------------------------------------------
+code=$(curl -s -o "$BASE/upload.json" -w '%{http_code}' \
+    -X POST "$CLI_HOST/v1/uploads?name=box.stl" --data-binary @"$BASE/in/box.stl")
+[ "$code" = "201" ] || { log "FAIL: upload returned $code (expected 201)"; cat "$BASE/upload.json" >&2 || true; exit 1; }
+python3 - "$BASE/upload.json" "$STL_SHA" <<'PY'
+import json, sys
+up = json.load(open(sys.argv[1]))
+assert up["sha256"] == sys.argv[2], up
+assert up["name"] == "box.stl", up
+assert up["stl_path"].startswith("/"), up
+print("upload ok: sha256 matches fixture, path is absolute")
+PY
+log "upload staged with matching sha256"
+
 # ---- submit (snake_case) ----------------------------------------------------
 code=$(curl -s -o "$BASE/submit.json" -w '%{http_code}' -X POST "$CLI_HOST/v1/jobs" \
     -H 'Content-Type: application/json' \
@@ -159,7 +174,7 @@ log "report input sha256 matches and created_at_utc populated"
 
 # ---- artifacts ---------------------------------------------------------------
 art=$(curl -sf "$CLI_HOST/v1/jobs/$JOB_ID/artifacts")
-for name in box.stp box_iso.png box.report.json; do
+for name in box.stp box_iso.png box_section.png box_left.png box_top.png box_right.png box_bottom.png box.report.json; do
     printf '%s' "$art" | python3 -c "
 import json,sys
 names=[a['name'] for a in json.load(sys.stdin).get('files',[])]

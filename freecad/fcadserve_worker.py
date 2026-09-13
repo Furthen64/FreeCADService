@@ -7,7 +7,7 @@ pipeline that needs no display:
   load STL -> reconstruct (or fall back) -> export STEP
   -> re-import validate -> write report
 
-Rendering of the isometric and cutaway PNGs happens in a separate, GUI-capable
+Rendering of the six standard PNG views happens in a separate, GUI-capable
 process owned by ``fcadserve_render.py`` (a real display/X output is required
 for that step). Job parameters travel exclusively via the FCADSERVE_JOB_PARAMS
 environment variable. Progress and final status are written as atomic JSON
@@ -246,12 +246,16 @@ class Worker:
             },
             "rendering": {
                 "status": "pending",
+                "views": ["iso", "section", "left", "top", "right", "bottom"],
             },
             "artifacts": {
                 "step": self.p["target_names"]["step"],
                 "iso_png": None,
                 "section_png": None,
-                "section_unavailable_reason": None,
+                "left_png": None,
+                "top_png": None,
+                "right_png": None,
+                "bottom_png": None,
             },
             "steps": self.steps,
             "timestamps": {

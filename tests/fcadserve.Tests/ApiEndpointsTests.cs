@@ -41,6 +41,7 @@ public class ApiEndpointsTests
         public string Input => Path.Combine(Root, "in");
         public string Output => Path.Combine(Root, "out");
         public string State => Path.Combine(Root, "state");
+        public string Uploads => Path.Combine(State, "uploads");
         public string Stl => Path.Combine(Input, "part.stl");
         public string WorkerScript => Path.Combine(Root, "worker-fixture.sh");
         public WebApplicationFactory<Program> Factory { get; }
@@ -200,6 +201,103 @@ public class ApiEndpointsTests
         Assert.Equal(System.Net.HttpStatusCode.Conflict, resp.StatusCode);
         using var doc = await ReadAsync(resp);
         Assert.Equal("output_already_exists", doc.RootElement.GetProperty("code").GetString());
+    }
+
+    private static ByteArrayContent UploadBody(byte[] bytes) => new(bytes);
+
+    private static readonly string SampleStl = new string('\x00', 80)
+        + "\x00\x00\x00\x00\x01\x00\x00\x00"         // facet count = 1
+        + "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" // normal
+        + "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" // v1
+        + "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" // v2
+        + "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" // v3
+        + "\x00\x00";
+
+    [Fact]
+    public async Task Upload_stores_stl_and_returned_path_can_be_submitted()
+    {
+        using var box = new Sandbox(TimeSpan.FromMinutes(5));
+        using var env = box.Scope();
+
+        var bytes = Encoding.UTF8.GetBytes(SampleStl);
+        var upload = await box.Client.PostAsync("/v1/uploads?name=part.stl", UploadBody(bytes));
+        Assert.Equal(System.Net.HttpStatusCode.Created, upload.StatusCode);
+
+        using var doc = await ReadAsync(upload);
+        var stlPath = doc.RootElement.GetProperty("stl_path").GetString()!;
+        Assert.StartsWith(box.Uploads, stlPath);
+        Assert.Equal("part.stl", doc.RootElement.GetProperty("name").GetString());
+        Assert.EndsWith(".stl", stlPath);
+        Assert.Equal(bytes.Length, doc.RootElement.GetProperty("size_bytes").GetInt64());
+        Assert.Equal(ComputeSha256(bytes), doc.RootElement.GetProperty("sha256").GetString());
+        Assert.True(File.Exists(stlPath));
+
+        var submit = await box.Client.PostAsync("/v1/jobs", Snake(stlPath, box.Output));
+        Assert.Equal(System.Net.HttpStatusCode.Accepted, submit.StatusCode);
+        using var submitDoc = await ReadAsync(submit);
+        Assert.Equal("queued", submitDoc.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task Upload_content_disposition_filename_is_used_when_no_query_name()
+    {
+        using var box = new Sandbox(TimeSpan.FromMinutes(5));
+        using var env = box.Scope();
+
+        var upload = await box.Client.PostAsync("/v1/uploads",
+            new ByteArrayContent(Encoding.UTF8.GetBytes(SampleStl))
+            {
+                Headers = { { "Content-Disposition", "attachment; filename=\"from-header.stl\"" } },
+            });
+        Assert.Equal(System.Net.HttpStatusCode.Created, upload.StatusCode);
+        using var doc = await ReadAsync(upload);
+        Assert.Equal("from-header.stl", doc.RootElement.GetProperty("name").GetString());
+    }
+
+    [Theory]
+    [InlineData("/v1/uploads", "missing_filename")]
+    [InlineData("/v1/uploads?name=part.obj", "unsupported_extension")]
+    public async Task Upload_invalid_requests_are_rejected(string url, string expectedCode)
+    {
+        using var box = new Sandbox(TimeSpan.FromMinutes(5));
+        using var env = box.Scope();
+
+        var resp = await box.Client.PostAsync(url, UploadBody(Encoding.UTF8.GetBytes("x")));
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, resp.StatusCode);
+        using var doc = await ReadAsync(resp);
+        Assert.Equal(expectedCode, doc.RootElement.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Upload_path_traversal_name_is_sanitized_and_stored_inside_root()
+    {
+        using var box = new Sandbox(TimeSpan.FromMinutes(5));
+        using var env = box.Scope();
+
+        var resp = await box.Client.PostAsync("/v1/uploads?name=..%2F..%2Fevil.stl", UploadBody(Encoding.UTF8.GetBytes("x")));
+        Assert.Equal(System.Net.HttpStatusCode.Created, resp.StatusCode);
+        using var doc = await ReadAsync(resp);
+        var stlPath = doc.RootElement.GetProperty("stl_path").GetString()!;
+        Assert.Equal(".stl", Path.GetExtension(stlPath));
+        Assert.StartsWith(box.Uploads, stlPath);
+    }
+
+    [Fact]
+    public async Task Upload_exceeding_max_input_size_returns_413()
+    {
+        using var box = new Sandbox(TimeSpan.FromMinutes(5), maxInputBytes: 32);
+        using var env = box.Scope();
+
+        var resp = await box.Client.PostAsync("/v1/uploads?name=big.stl", UploadBody(new byte[64]));
+        Assert.Equal(System.Net.HttpStatusCode.RequestEntityTooLarge, resp.StatusCode);
+        using var doc = await ReadAsync(resp);
+        Assert.Equal("input_too_large", doc.RootElement.GetProperty("code").GetString());
+    }
+
+    private static string ComputeSha256(byte[] bytes)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        return Convert.ToHexStringLower(sha.ComputeHash(bytes));
     }
 
     [Fact]
