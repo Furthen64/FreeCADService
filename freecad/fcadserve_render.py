@@ -15,11 +15,82 @@ directory. Exits 0 on success/skip and non-zero on failure.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
 import zlib
 from datetime import datetime, timezone
+
+
+MAX_EDGE_LABELS = 24
+
+
+def _norm(v):
+    return math.sqrt(sum(x * x for x in v))
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _orthonormal_view(direction, up):
+    """Return ``(direction, up)`` as unit vectors with ``up`` perpendicular to
+    ``direction``.
+
+    FreeCAD re-orthogonalizes a non-perpendicular screen-up against the view
+    direction; doing it here keeps every stored camera basis self-consistent so
+    edge-label projection and report metadata match what is actually rendered.
+    The world-Z component of ``up`` is preserved where possible so views that
+    should read as "Z vertical" do.
+    """
+    d = [float(x) for x in direction]
+    dn = _norm(d)
+    if dn == 0.0:
+        raise ValueError("view direction must be non-zero")
+    d = [x / dn for x in d]
+    u = [float(x) for x in up]
+    dot = sum(a * b for a, b in zip(u, d))
+    u = [a - dot * b for a, b in zip(u, d)]
+    un = _norm(u)
+    if un < 1e-9:
+        # ``up`` was parallel to the view direction; pick any perpendicular axis.
+        ref = (0.0, 1.0, 0.0) if abs(d[1]) < 0.9 else (1.0, 0.0, 0.0)
+        u = _cross(d, ref)
+        un = _norm(u)
+    return tuple(d), tuple(a / un for a in u)
+
+
+# Intended camera basis per view: look direction points from the camera toward
+# the model; up establishes the vertical screen axis. Each pair is orthonormalized
+# so the stored vectors are guaranteed consistent (see _orthonormal_view).
+_VIEW_CAMERA_INTENTS = {
+    "iso": ((1.0, -1.0, -1.0), (0.0, 0.0, 1.0)),
+    "section": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    "left": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    "top": ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+    "right": ((-1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    "bottom": ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),
+}
+
+VIEW_CAMERAS = {name: _orthonormal_view(d, u) for name, (d, u) in _VIEW_CAMERA_INTENTS.items()}
+
+# FreeCAD's canonical standard-view presets. Orientation is delegated to these
+# built-ins (rather than hand-computed vectors) so a preview cannot be rotated
+# by an incorrect camera basis; VIEW_CAMERAS supplies the matching reference
+# basis used only for edge-label projection and report metadata.
+STANDARD_VIEW_METHODS = {
+    "iso": "viewIsometric",
+    # The cut is normal to X; this has the same screen basis as the verified
+    # left cardinal view (Y horizontal, Z vertical).
+    "section": "viewLeft",
+    "left": "viewLeft",
+    "top": "viewTop",
+    "right": "viewRight",
+    "bottom": "viewBottom",
+}
 
 
 def now_utc():
@@ -163,7 +234,7 @@ def validate_png(path, expected_width, expected_height):
                     raise RuntimeError("PNG palette is missing or invalid")
                 if palette[palette_index:palette_index + 3] != b"\xff\xff\xff":
                     has_visible_non_white_pixel = True
-            elif color_type == 4 and row[pixel] and row[pixel + 1] != 255:
+            elif color_type == 4 and row[pixel + 1] > 0 and row[pixel] != 255:
                 has_visible_non_white_pixel = True
             elif color_type == 6 and row[pixel + 3] and row[pixel:pixel + 3] != b"\xff\xff\xff":
                 has_visible_non_white_pixel = True
@@ -171,6 +242,70 @@ def validate_png(path, expected_width, expected_height):
 
     if not has_visible_non_white_pixel:
         raise RuntimeError("PNG contains no visible non-white model pixels")
+
+
+def add_edge_length_labels(render_view, shape, direction, up):
+    """Add screen-facing labels for the model's most useful straight edges.
+
+    Labels are Coin scene-graph overlays, rather than Draft dimensions, so they
+    neither require a workbench nor enlarge the model's fitted bounding box.
+    Curved and tessellation edges are deliberately omitted: their arc length is
+    rarely a useful manufacturing dimension and they make previews illegible.
+    """
+    import FreeCAD as App  # noqa: PLC0415
+    from pivy import coin  # noqa: PLC0415
+
+    labels = []
+    seen = set()
+    camera_direction = App.Vector(*direction)
+    screen_up = App.Vector(*up)
+    screen_right = camera_direction.cross(screen_up)
+    for edge in shape.Edges:
+        if len(edge.Vertexes) != 2 or "Line" not in type(edge.Curve).__name__:
+            continue
+        start, end = (vertex.Point for vertex in edge.Vertexes)
+        key = tuple(sorted((
+            (round(start.x, 6), round(start.y, 6), round(start.z, 6)),
+            (round(end.x, 6), round(end.y, 6), round(end.z, 6)),
+        )))
+        if key in seen or edge.Length <= 1e-6:
+            continue
+        seen.add(key)
+        projected_length = max(
+            abs((end - start).dot(screen_right)),
+            abs((end - start).dot(screen_up)),
+        )
+        # An edge parallel to the camera ray is invisible (a point or an
+        # overlapping line) in the PNG, so annotating it is misleading.
+        if projected_length <= edge.Length * 1e-4:
+            continue
+        labels.append((edge.Length, (start + end) * 0.5))
+
+    # Prefer the longest edges when there are many, since tiny edges create
+    # unreadable clusters and contribute little useful dimensional context.
+    labels.sort(key=lambda item: item[0], reverse=True)
+    labels = labels[:MAX_EDGE_LABELS]
+    if not labels:
+        return
+
+    root = coin.SoSeparator()
+    color = coin.SoBaseColor()
+    color.rgb = (0.10, 0.10, 0.10)
+    root.addChild(color)
+    font = coin.SoFont()
+    font.size = 14
+    root.addChild(font)
+    for length, midpoint in labels:
+        item = coin.SoSeparator()
+        translation = coin.SoTranslation()
+        translation.translation = midpoint
+        text = coin.SoText2()
+        text.string = f"{length:.2f} mm"
+        text.justification = coin.SoText2.CENTER
+        item.addChild(translation)
+        item.addChild(text)
+        root.addChild(item)
+    render_view.getSceneGraph().addChild(root)
 
 
 def render_doc(shape, out_path, width, height, view="iso"):
@@ -195,24 +330,15 @@ def render_doc(shape, out_path, width, height, view="iso"):
         render_view.setAnimationEnabled(False)
         render_view.stopAnimating()
         render_view.setCameraType("Orthographic")
-        if view == "section":
-            # build_cutaway removes the half with the smaller X coordinates,
-            # so its exposed cut face has a -X normal. setViewDirection()
-            # points the camera toward the model, so use the direction from
-            # the -X side of the cut plane toward the model.
-            render_view.setViewDirection((1.0, 0.0, 0.0))
-        else:
-            standard_views = {
-                "iso": render_view.viewIsometric,
-                "left": render_view.viewLeft,
-                "top": render_view.viewTop,
-                "right": render_view.viewRight,
-                "bottom": render_view.viewBottom,
-            }
-            try:
-                standard_views[view]()
-            except KeyError:
-                raise ValueError(f"unknown render view: {view!r}") from None
+        if view not in VIEW_CAMERAS:
+            raise ValueError(f"unknown render view: {view!r}")
+        direction, up = VIEW_CAMERAS[view]
+        # FreeCAD 1.1's Python API has no up-vector setter. Delegate all
+        # orientation to the canonical presets instead of using a custom
+        # direction that FreeCAD may roll differently between versions.
+        getattr(render_view, STANDARD_VIEW_METHODS[view])()
+        Gui.updateGui()
+        add_edge_length_labels(render_view, shape, direction, up)
 
         # Apply camera changes synchronously before the offscreen grab. The
         # queued ViewFit message could otherwise leave saveImage() capturing
@@ -249,7 +375,7 @@ def build_cutaway(shape, part):
     return result
 
 
-def patch_report(artifacts_dir, target, section_reason=None):
+def patch_report(artifacts_dir, target, section_reason=None, section_plane=None):
     try:
         path = os.path.join(artifacts_dir, target["report"])
         with open(path, encoding="utf-8") as fh:
@@ -261,7 +387,20 @@ def patch_report(artifacts_dir, target, section_reason=None):
         name for name in ("iso", "section", "left", "top", "right", "bottom")
         if os.path.exists(os.path.join(artifacts_dir, target[f"{name}_png"]))
     ]
-    report["rendering"] = {"status": "done", "views": views}
+    view_metadata = {
+        name: {
+            "camera_direction": list(VIEW_CAMERAS[name][0]),
+            "up_vector": list(VIEW_CAMERAS[name][1]),
+        }
+        for name in views
+    }
+    if section_plane is not None and "section" in view_metadata:
+        view_metadata["section"]["plane"] = section_plane
+    report["rendering"] = {
+        "status": "done",
+        "views": views,
+        "view_metadata": view_metadata,
+    }
     for name in ("iso", "section", "left", "top", "right", "bottom"):
         artifact_key = f"{name}_png"
         report["artifacts"][artifact_key] = target[artifact_key] if name in views else None
@@ -336,7 +475,13 @@ def main():
             ("right", shape),
             ("bottom", shape),
         )
+        section_plane = None
         try:
+            bb = shape.BoundBox
+            section_plane = {
+                "normal": [1.0, 0.0, 0.0],
+                "offset": bb.XMin + bb.XLength / 2.0,
+            }
             render_specs = (("section", build_cutaway(shape, Part)),) + render_specs
         except Exception as exc:
             result["section_enabled"] = False
@@ -351,7 +496,7 @@ def main():
 
         result["ok"] = True
         set_phase(job_dir, p["progress_path"], "writing_report")
-        patch_report(artifacts_dir, target, result["reason"])
+        patch_report(artifacts_dir, target, result["reason"], section_plane)
         result["status"] = "ok"
     except Exception as exc:
         import traceback  # noqa: PLC0415

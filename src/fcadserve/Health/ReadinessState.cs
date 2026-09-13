@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using FcadServe.Jobs;
 using FcadServe.Options;
 using FcadServe.Security;
@@ -20,7 +21,7 @@ public sealed class ReadinessState(ServiceOptions options, JobDatabase db)
             ["state_root"] = CheckStateRoot(),
             ["xvfb"] = CheckExecutable(options.Xvfb.Executable, "FCADSERVE_XVFB__EXECUTABLE"),
             ["worker_script"] = CheckWorkerScript(),
-            ["freecad"] = CheckFreeCad(),
+            ["freecad"] = await CheckFreeCadAsync(ct),
             ["input_roots"] = CheckInputRoots(),
             ["output_policy"] = CheckOutputPolicy(),
         };
@@ -61,7 +62,7 @@ public sealed class ReadinessState(ServiceOptions options, JobDatabase db)
             ? new CheckResult(true, options.WorkerScript)
             : new CheckResult(false, $"worker script missing: {options.WorkerScript}");
 
-    private CheckResult CheckFreeCad()
+    private async Task<CheckResult> CheckFreeCadAsync(CancellationToken ct)
     {
         if (string.Equals(options.FreeCad.Mode, "exec", StringComparison.OrdinalIgnoreCase))
         {
@@ -77,7 +78,51 @@ public sealed class ReadinessState(ServiceOptions options, JobDatabase db)
         var flatpak = CheckExecutable("flatpak", "PATH");
         if (!flatpak.Ok)
             return flatpak;
-        return new CheckResult(true, $"flatpak mode: {options.FreeCad.FlatpakAppId} (verify installed with 'flatpak list' at setup time)");
+
+        // Verify the FreeCAD application itself is present, not just the flatpak
+        // runtime binary, so readiness does not report ready while both job
+        // stages would fail at launch.
+        var appId = options.FreeCad.FlatpakAppId;
+        switch (await FlatpakAppInstalledAsync(appId, ct))
+        {
+            case true:
+                return new CheckResult(true, $"flatpak mode: {appId}");
+            case false:
+                return new CheckResult(false, $"flatpak app not installed: {appId} (install with 'flatpak install flathub {appId}')");
+            default:
+                return new CheckResult(false, $"could not verify flatpak app {appId} is installed");
+        }
+    }
+
+    // Returns whether a flatpak app id is installed; null when it could not be
+    // determined (flatpak hung or errored). Bounded by a timeout so a wedged
+    // flatpak cannot stall the readiness probe.
+    private static async Task<bool?> FlatpakAppInstalledAsync(string appId, CancellationToken ct)
+    {
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(10));
+            using var proc = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "flatpak",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    ArgumentList = { "info", appId },
+                },
+            };
+            if (!proc.Start())
+                return null;
+            await proc.WaitForExitAsync(cts.Token);
+            return proc.ExitCode == 0;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private CheckResult CheckExecutable(string name, string source)

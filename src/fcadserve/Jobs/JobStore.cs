@@ -124,17 +124,36 @@ public sealed class JobStore(JobDatabase db, ServiceOptions options, ILogger<Job
     public async Task<List<JobRecord>> RecoverOrphansAsync(CancellationToken ct = default)
     {
         var stale = await db.GetByStatusAsync([JobStatus.Queued, JobStatus.Running], ct);
+        var recovered = new List<JobRecord>();
         foreach (var job in stale)
         {
+            var previous = job.Status;
+            if (previous == JobStatus.Running && !options.Jobs.RequeueRunningJobsOnStartup)
+            {
+                // Operator opted out of auto-restarting in-flight jobs. Park them
+                // as failed so they reach a terminal state instead of hanging, and
+                // let the client resubmit explicitly.
+                job.Status = JobStatus.Failed;
+                job.Phase = JobPhase.Finished;
+                job.CancelRequested = false;
+                job.ErrorCode = "not_recovered_after_restart";
+                job.Error = "job was interrupted by a service restart and re-queueing running jobs is disabled.";
+                job.FinishedAtUtc = DateTimeOffset.UtcNow;
+                await SaveAsync(job, ct);
+                logger.LogWarning("Left interrupted job {JobId} ({Previous}) failed: re-queue on startup disabled", job.Id, previous);
+                continue;
+            }
+
             job.Status = JobStatus.Queued;
             job.Phase = JobPhase.Queued;
             job.CancelRequested = false;
             job.ErrorCode = "recovered_after_restart";
             job.Error = "job was interrupted by a service restart and has been re-queued.";
             await SaveAsync(job, ct);
-            logger.LogWarning("Re-queued job {JobId} ({PreviousStatus}) after restart", job.Id, job.Status);
+            recovered.Add(job);
+            logger.LogWarning("Re-queued job {JobId} ({Previous}) after restart", job.Id, previous);
         }
-        return stale;
+        return recovered;
     }
 
     public async Task<int> PruneAsync(CancellationToken ct = default)
@@ -179,7 +198,7 @@ public sealed class JobStore(JobDatabase db, ServiceOptions options, ILogger<Job
             var root = doc.RootElement;
             if (root.TryGetProperty("phase", out var phaseEl)
                 && phaseEl.ValueKind == JsonValueKind.String
-                && Enum.TryParse<JobPhase>(phaseEl.GetString(), ignoreCase: true, out var phase))
+                && TryParsePhase(phaseEl.GetString(), out var phase))
             {
                 job.Phase = phase;
             }
@@ -188,5 +207,20 @@ public sealed class JobStore(JobDatabase db, ServiceOptions options, ILogger<Job
         {
             logger.LogDebug(ex, "Failed to read progress file {Path}", progress);
         }
+    }
+
+    // Worker/renderer emit snake_case tokens ("loading_stl", "exporting_step")
+    // while JobPhase members are PascalCase without separators ("LoadingStl").
+    // Normalize by dropping non-letter characters and comparing case-insensitively.
+    private static bool TryParsePhase(string? raw, out JobPhase phase)
+    {
+        if (!string.IsNullOrEmpty(raw))
+        {
+            var normalized = new string(raw.Where(char.IsLetter).ToArray());
+            if (Enum.TryParse(normalized, ignoreCase: true, out phase))
+                return true;
+        }
+        phase = default;
+        return false;
     }
 }

@@ -12,7 +12,7 @@ public class JobStoreTests
         public void Dispose() { try { Directory.Delete(root, true); } catch { /* best effort */ } }
     }
 
-    private static async Task<(JobStore Store, JobDatabase Db, Scope Scope)> OpenStoreAsync(int maxRetained = 5)
+    private static async Task<(JobStore Store, JobDatabase Db, Scope Scope)> OpenStoreAsync(int maxRetained = 5, bool requeueRunningOnStartup = true)
     {
         var root = Path.Combine(Path.GetTempPath(), "fcadserve-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
@@ -20,6 +20,7 @@ public class JobStoreTests
         {
             StateRoot = root,
             Retention = { MaxRetainedJobs = maxRetained },
+            Jobs = { RequeueRunningJobsOnStartup = requeueRunningOnStartup },
         };
         var db = new JobDatabase(options, NullLogger<JobDatabase>.Instance);
         await db.InitializeAsync();
@@ -143,6 +144,49 @@ public class JobStoreTests
         Assert.Equal(1, removed);
         Assert.False(Directory.Exists(workDir));
         Assert.Null(await store.GetAsync(job.Id));
+    }
+
+    [Fact]
+    public async Task RecoverOrphans_leaves_running_failed_when_requeue_disabled()
+    {
+        var (store, _, scope) = await OpenStoreAsync(requeueRunningOnStartup: false);
+        using var _ = scope;
+
+        var queued = await store.CreateAsync(store.CreateJobId(), "/tmp/q.stl", null, "/tmp", 10, "abc");
+        var running = await store.CreateAsync(store.CreateJobId(), "/tmp/r.stl", null, "/tmp", 10, "abc");
+        await store.MarkRunningAsync(running);
+
+        var recovered = await store.RecoverOrphansAsync();
+
+        // Only the never-started job is re-queued; the interrupted one is parked as failed.
+        Assert.Single(recovered);
+        Assert.Equal(queued.Id, recovered[0].Id);
+
+        var gotQ = await store.GetAsync(queued.Id);
+        var gotR = await store.GetAsync(running.Id);
+        Assert.Equal(JobStatus.Queued, gotQ!.Status);
+        Assert.Equal(JobStatus.Failed, gotR!.Status);
+        Assert.True(gotR.IsTerminal);
+        Assert.Equal("not_recovered_after_restart", gotR.ErrorCode);
+        Assert.NotNull(gotR.FinishedAtUtc);
+    }
+
+    [Fact]
+    public async Task GetAsync_merges_snake_case_phase_from_progress_file()
+    {
+        var (store, _, scope) = await OpenStoreAsync();
+        using var _ = scope;
+
+        var job = await store.CreateAsync(store.CreateJobId(), "/tmp/a.stl", null, "/tmp", 10, "abc");
+        await store.MarkRunningAsync(job);
+
+        var workDir = store.JobWorkDir(job.Id);
+        Directory.CreateDirectory(workDir);
+        File.WriteAllText(Path.Combine(workDir, "progress.json"),
+            "{\"phase\":\"exporting_step\",\"updated_at_utc\":\"2024-01-01T00:00:00Z\"}");
+
+        var got = await store.GetAsync(job.Id);
+        Assert.Equal(JobPhase.ExportingStep, got!.Phase);
     }
 }
 
